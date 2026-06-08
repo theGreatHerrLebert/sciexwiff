@@ -34,10 +34,24 @@ simulated output).
 
 The decoding above was validated against:
 
-> **PRIDE `PXD036786`** — ZenoTOF 7600, K562 0.98 ng, ~53 MB `.wiff2.Zip`
-> (`.wiff` OLE2 ~11 MB + `.wiff2` ~29 MB + `.wiff.scan` ~32 MB).
+> **PRIDE `PXD036786`** — *"High-throughput proteomics of nanogram-scale
+> samples with Zeno SWATH DIA"* (ZenoTOF 7600, pub. 2022/12).
 
-No vendor data is committed here; re-download from PRIDE to run.
+No vendor data is committed here; re-download from PRIDE to run. FTP archive:
+`https://ftp.pride.ebi.ac.uk/pride/data/archive/2022/12/PXD036786/`. The file
+used for development (K562 0.98 ng, standard SWATH, ~53 MB `.wiff2.Zip` =
+`.wiff` OLE2 11 MB + `.wiff2` 29 MB + `.wiff.scan` 32 MB):
+
+```
+20211020_Z1_ZW_001_30-0043_K562_1ul_K562_0.98ng_1.wiff2.Zip
+```
+
+(There is also a `..._zeno_0.98ng_1.wiff2.Zip`, ~96 MB, for Zeno-mode SWATH.)
+
+Local dev layout this repo was validated against (not portable; adjust to your
+machine): the bundle is unzipped under `~/thermo-raw-spike/data/sciex/` and run
+as `cargo run --release -- <unzipped>/...K562_0.98ng_1.wiff`, reproducing 60
+SWATH windows (399.5–899.9 m/z) and TOF calibration (4.898e-4 / -12.90).
 
 ## Usage
 
