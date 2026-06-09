@@ -41,12 +41,21 @@ fn f64le(b: &[u8], o: usize) -> Option<f64> {
         .map(|s| f64::from_le_bytes(s.try_into().unwrap()))
 }
 
-fn read_stream(comp: &mut cfb::CompoundFile<std::fs::File>, name: &str) -> Option<Vec<u8>> {
+/// Read a stream's bytes. `Ok(None)` means the stream is genuinely absent;
+/// `Err` means it exists but could not be read (corruption / short read).
+fn read_stream(
+    comp: &mut cfb::CompoundFile<std::fs::File>,
+    name: &str,
+) -> io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    let mut s = comp.open_stream(name).ok()?;
+    let mut s = match comp.open_stream(name) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let mut v = Vec::new();
-    s.read_to_end(&mut v).ok()?;
-    Some(v)
+    s.read_to_end(&mut v)?;
+    Ok(Some(v))
 }
 
 /// Open a `.wiff` (OLE2 compound file) and decode its SWATH method + TOF
@@ -57,33 +66,46 @@ fn read_stream(comp: &mut cfb::CompoundFile<std::fs::File>, name: &str) -> Optio
 pub fn read_method<P: AsRef<Path>>(path: P) -> io::Result<WiffMethod> {
     let mut comp = cfb::open(path.as_ref())?;
 
-    let mut swath_windows = Vec::new();
-    if let Some(sw) = read_stream(&mut comp, "/MethodSubtree/Method1/DeviceMethod0/SWATHMethod") {
-        let (base, stride) = (40usize, 20usize);
-        if sw.len() > base {
-            let n = (sw.len() - base) / stride;
-            for k in 0..n {
-                let o = base + k * stride;
-                if let (Some(lo), Some(hi)) = (f64le(&sw, o), f64le(&sw, o + 8)) {
-                    if lo.is_finite() && hi.is_finite() && hi > lo {
-                        swath_windows.push(SwathWindow {
-                            lower_mz: lo,
-                            upper_mz: hi,
-                        });
-                    }
-                }
+    // SWATHMethod is required and must be well-formed: a 40-byte preamble + an
+    // exact number of 20-byte `{ f64 lower, f64 upper, u32 }` records.
+    let sw = read_stream(&mut comp, "/MethodSubtree/Method1/DeviceMethod0/SWATHMethod")?
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no SWATHMethod stream (not a SWATH .wiff?)")
+        })?;
+    const BASE: usize = 40;
+    const STRIDE: usize = 20;
+    if sw.len() < BASE || (sw.len() - BASE) % STRIDE != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SWATHMethod stream has a truncated record table ({} bytes)", sw.len()),
+        ));
+    }
+    let n = (sw.len() - BASE) / STRIDE;
+    let mut swath_windows = Vec::with_capacity(n);
+    for k in 0..n {
+        let o = BASE + k * STRIDE;
+        let (lo, hi) = (f64le(&sw, o), f64le(&sw, o + 8));
+        match (lo, hi) {
+            (Some(lo), Some(hi))
+                if lo.is_finite() && hi.is_finite() && hi > lo && lo.abs() < 1e7 && hi.abs() < 1e7 =>
+            {
+                swath_windows.push(SwathWindow { lower_mz: lo, upper_mz: hi });
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("SWATHMethod record {k} is malformed (lower={lo:?}, upper={hi:?})"),
+                ))
             }
         }
     }
 
-    let tof_calibration = read_stream(&mut comp, "/SampleSubtree/Sample1/TOFCalibrationData")
+    // TOF calibration is optional; absent or unreadably-short -> None.
+    let tof_calibration = read_stream(&mut comp, "/SampleSubtree/Sample1/TOFCalibrationData")?
         .and_then(|cal| {
             let c1 = f64le(&cal, 32)?;
             let c2 = f64le(&cal, 40)?;
-            (c1.is_finite() && c2.is_finite()).then_some(TofCalibration {
-                coef1: c1,
-                coef2: c2,
-            })
+            (c1.is_finite() && c2.is_finite()).then_some(TofCalibration { coef1: c1, coef2: c2 })
         });
 
     Ok(WiffMethod {
