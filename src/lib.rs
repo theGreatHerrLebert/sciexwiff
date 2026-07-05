@@ -60,6 +60,38 @@ fn read_stream(
     Ok(Some(v))
 }
 
+/// Read the `Idx` scan directory stream out of a `.wiff` CFB
+/// (`/SampleSubtree/Sample1/Idx`) — the 108-byte-record table the `.wiff.scan`
+/// writer needs to map/recompute segment offsets. `NotFound` if the container
+/// has no `Idx` (not a spectra-bearing `.wiff`).
+pub fn read_idx_stream<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+    let mut comp = cfb::open(path.as_ref())?;
+    read_stream(&mut comp, "/SampleSubtree/Sample1/Idx")?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no Idx stream (not a spectra .wiff?)")
+    })
+}
+
+/// Overwrite the `Idx` stream of a `.wiff` CFB **in place**. The recomputed Idx
+/// (from [`wiffscan::recompute_idx`]) is exactly the same length as the original,
+/// so this rewrites the existing stream without changing the CFB layout. Errors
+/// (leaving the file unchanged) if the lengths differ, guarding against a partial
+/// clobber. Open the file read-write via `cfb::open_rw`.
+pub fn patch_idx_stream<P: AsRef<Path>>(path: P, new_idx: &[u8]) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut comp = cfb::open_rw(path.as_ref())?;
+    let mut s = comp.open_stream("/SampleSubtree/Sample1/Idx")?;
+    if s.len() as usize != new_idx.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Idx length changed ({} -> {}); refusing in-place patch", s.len(), new_idx.len()),
+        ));
+    }
+    s.seek(SeekFrom::Start(0))?;
+    s.write_all(new_idx)?;
+    s.flush()?;
+    Ok(())
+}
+
 /// Open a `.wiff` (OLE2 compound file) and decode its SWATH method + TOF
 /// calibration. The SWATH windows live in
 /// `/MethodSubtree/Method1/DeviceMethod0/SWATHMethod` as 20-byte records
