@@ -436,6 +436,108 @@ pub fn recompute_idx(
     Ok(idx)
 }
 
+// ============================================================================================
+// GROW writer: author arbitrary token lengths (peaks/scan) and retranslate EVERY Idx offset.
+//
+// The [`rebuild`] path only recomputes the *enumerated* segments, so it corrupts the ~4% of Idx
+// records that reference blocks `scan_blocks` does not enumerate (empty / embedded-`ffffffff`
+// blocks) once byte positions shift. The grow path avoids that by building an old→new byte
+// offset MAP (from where each grown block adds/removes bytes) and translating every Idx offset
+// field through it — so mapped and unmapped records alike stay valid. Only blocks with a clean
+// tail (`tokens + terminator`, no embedded `ffffffff`) are grown; the caller leaves the rare
+// messy blocks out of `edits` (copied verbatim).
+// ============================================================================================
+
+/// A grown block edit: replace the block's whole body `[ff+9 .. end]` with `tokens` (the
+/// caller supplies a complete token stream — the reader bounds the scan by the recomputed Idx
+/// span, so no terminator is required). `block` indexes into the `blocks` slice. The block must
+/// have a clean tail (no embedded `ffffffff`), else replacing the body would drop a mini-block.
+pub struct GrowEdit {
+    pub block: usize,
+    pub tokens: Vec<u8>,
+}
+
+/// Rebuild the `.wiff.scan`, replacing each edited block's body with an arbitrary-length token
+/// stream. Returns the new bytes and a sorted `(old_offset, cumulative_delta)` breakpoint list
+/// for [`translate_offset`] / [`retranslate_idx`]. Edits are applied in ascending block
+/// position; everything between blocks (metadata, mini-blocks, trailing bytes) is copied
+/// verbatim and simply shifts. Using the whole `[ff+9 .. end]` body as the edit span avoids any
+/// token/terminator-boundary guess (which is fragile for blocks whose last peak encodes 0xff).
+pub fn rebuild_grow(
+    scan: &[u8],
+    blocks: &[ScanBlock],
+    edits: &[GrowEdit],
+) -> Result<(Vec<u8>, Vec<(usize, i64)>), WriterError> {
+    validate_blocks(scan, blocks)?;
+    // Sort edits by the block body start; ensure they are disjoint and in range.
+    let mut ordered: Vec<(usize, usize, &[u8])> = Vec::with_capacity(edits.len());
+    for e in edits {
+        let b = blocks.get(e.block).ok_or(WriterError::BadBlock(e.block))?;
+        let tok_start = b.ff + 9;
+        let tok_end = b.end; // replace the whole body
+        ordered.push((tok_start, tok_end, &e.tokens));
+    }
+    ordered.sort_by_key(|&(s, _, _)| s);
+    let mut out = Vec::with_capacity(scan.len() + (1 << 16));
+    let mut breakpoints: Vec<(usize, i64)> = Vec::with_capacity(ordered.len());
+    let mut cum: i64 = 0;
+    let mut cursor = 0usize;
+    for (tok_start, tok_end, tokens) in ordered {
+        if tok_start < cursor || tok_end < tok_start || tok_end > scan.len() {
+            return Err(WriterError::BadBlock(0)); // overlapping / malformed edit
+        }
+        out.extend_from_slice(&scan[cursor..tok_start]); // verbatim up to the token stream
+        out.extend_from_slice(tokens); // the grown tokens
+        cum += tokens.len() as i64 - (tok_end - tok_start) as i64;
+        breakpoints.push((tok_start, cum)); // any old offset >= tok_end shifts by `cum`
+        cursor = tok_end; // skip the old tokens; the terminator (from tok_end) copies next
+    }
+    out.extend_from_slice(&scan[cursor..]); // rest verbatim
+    Ok((out, breakpoints))
+}
+
+/// Translate an old byte offset to its new position given the `rebuild_grow` breakpoints.
+/// Idx offsets point at `ffffffff` block starts, which never fall inside a grown token region,
+/// so the mapping is unambiguous.
+pub fn translate_offset(old: usize, breakpoints: &[(usize, i64)]) -> usize {
+    // Largest breakpoint whose token-start position is < `old` applies (a block that starts at
+    // or after `old` does not shift it). Breakpoints are sorted by position.
+    let i = breakpoints.partition_point(|&(pos, _)| pos < old);
+    let d = if i == 0 { 0 } else { breakpoints[i - 1].1 };
+    (old as i64 + d) as usize
+}
+
+/// Retranslate every Idx record's `+32` / `+86` / `+36` offsets through the `rebuild_grow`
+/// breakpoint map. Handles ALL records (enumerated or not); the Idx length is unchanged.
+pub fn retranslate_idx(idx: &[u8], breakpoints: &[(usize, i64)]) -> Result<Vec<u8>, WriterError> {
+    let mut out = idx.to_vec();
+    let to_rel = |abs: usize| -> Result<u32, WriterError> {
+        abs.checked_sub(44)
+            .ok_or(WriterError::Truncated)
+            .and_then(|o| u32::try_from(o).map_err(|_| WriterError::Truncated))
+    };
+    for r in 0..idx.len() / IDX_RS {
+        let base = r * IDX_RS;
+        let o32 = u32le(idx, base + 32)? as usize;
+        let o86 = u32le(idx, base + 86)? as usize;
+        let o36 = u32le(idx, base + 36)? as usize;
+        if o32 > 0 {
+            let ff1_old = 44 + o32;
+            let ff1_new = translate_offset(ff1_old, breakpoints);
+            put_u32le(&mut out, base + 32, to_rel(ff1_new)?)?;
+            // +36 is block2_meta relative to block1; recompute from the translated positions.
+            let block2_meta_new = translate_offset(ff1_old + o36, breakpoints);
+            let new_o36 = block2_meta_new.checked_sub(ff1_new).ok_or(WriterError::Truncated)?;
+            put_u32le(&mut out, base + 36, u32::try_from(new_o36).map_err(|_| WriterError::Truncated)?)?;
+        }
+        if o86 > 0 {
+            let ff2_new = translate_offset(44 + o86, breakpoints);
+            put_u32le(&mut out, base + 86, to_rel(ff2_new)?)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Locate the `Idx` stream inside a `.wiff` CFB by an unambiguous 4-record needle (the Idx stream
 /// is unchanged in length, so it can be patched in place). Returns the stream's byte offset.
 pub fn locate_idx_in_wiff(raw: &[u8], idx: &[u8]) -> Option<usize> {
@@ -502,6 +604,47 @@ mod tests {
         let new_idx = recompute_idx(&idx, &segs, &new_ff, &metalen).expect("recompute_idx");
         assert_eq!(new_idx, idx, "no-edit Idx recompute != original");
         eprintln!("rebuild: {} blocks, {} indexed segments; no-edit round-trip OK", blocks.len(), segs.len());
+    }
+
+    /// Grow-writer identity: rebuilding with every block's tokens replaced by *its own* bytes
+    /// must reproduce the file byte-for-byte, all deltas zero, and retranslating the Idx must
+    /// leave it unchanged — proving the offset-map machinery is a correct no-op at rest. Gated
+    /// on `TIMSIM_SCIEX_WIFF_SCAN`.
+    #[test]
+    fn rebuild_grow_identity_real() {
+        let scan_path = match std::env::var("TIMSIM_SCIEX_WIFF_SCAN") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let wiff_path = scan_path.strip_suffix(".scan").expect("ends with .scan").to_string();
+        let scan = std::fs::read(&scan_path).expect("read .wiff.scan");
+        let mut comp = cfb::open(&wiff_path).expect("open .wiff CFB");
+        let mut idx = Vec::new();
+        {
+            use std::io::Read;
+            comp.open_stream("SampleSubtree/Sample1/Idx").unwrap().read_to_end(&mut idx).unwrap();
+        }
+        let blocks = scan_blocks(&scan);
+        // Identity edits: each block's tokens = exactly its own whole body [ff+9 .. end].
+        let mut edits = Vec::new();
+        for (i, b) in blocks.iter().enumerate() {
+            edits.push(GrowEdit { block: i, tokens: scan[b.ff + 9..b.end].to_vec() });
+        }
+        let (new_scan, bp) = rebuild_grow(&scan, &blocks, &edits).expect("rebuild_grow");
+        assert_eq!(new_scan, scan, "identity grow not byte-identical");
+        assert!(bp.iter().all(|&(_, c)| c == 0), "identity deltas must be zero");
+        let new_idx = retranslate_idx(&idx, &bp).expect("retranslate_idx");
+        assert_eq!(new_idx, idx, "identity retranslate != original Idx");
+        eprintln!("rebuild_grow identity OK: {} blocks, Idx {} records", blocks.len(), idx.len() / IDX_RS);
+    }
+
+    #[test]
+    fn translate_offset_shifts_after_grown_block() {
+        // A grown block at old token-start 100 that adds 5 bytes shifts everything at/after it.
+        let bp = vec![(100usize, 5i64)];
+        assert_eq!(translate_offset(50, &bp), 50, "before the grow: unchanged");
+        assert_eq!(translate_offset(100, &bp), 100, "at the grow start: unchanged");
+        assert_eq!(translate_offset(200, &bp), 205, "after the grow: +5");
     }
 
     #[test]
