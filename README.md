@@ -1,34 +1,42 @@
 # sciexwiff
 
-Minimal pure-Rust reader for the SCIEX `.wiff` acquisition **method**, built to
-extract the acquisition *design* a simulator needs to replicate a real SCIEX
-run — **not** a spectra reader.
+Pure-Rust tooling for SCIEX ZenoTOF data, reverse-engineered from the data files
+alone (no Clearcore2 SDK), in two parts:
 
-It opens the `.wiff` OLE2 / Compound File (via the [`cfb`](https://crates.io/crates/cfb)
-crate) and decodes:
+1. **`.wiff` method reader** — opens the `.wiff` OLE2 / Compound File (via the
+   [`cfb`](https://crates.io/crates/cfb) crate) and decodes the acquisition
+   *design* a simulator needs to replicate a run:
+   - **SWATH isolation scheme** — the variable isolation windows
+     (`/MethodSubtree/Method1/DeviceMethod0/SWATHMethod`).
+   - **TOF → m/z calibration** coefficients
+     (`/SampleSubtree/Sample1/TOFCalibrationData`).
+2. **`.wiff.scan` spectra codec** (`wiffscan` module) — decode **and** encode the
+   packed peak token stream that holds the actual spectra.
 
-- **SWATH isolation scheme** — the variable isolation windows
-  (`/MethodSubtree/Method1/DeviceMethod0/SWATHMethod`).
-- **TOF → m/z calibration** coefficients
-  (`/SampleSubtree/Sample1/TOFCalibrationData`).
+## The `.wiff.scan` spectra codec
 
-## Why only the method (and not the spectra)
+An earlier version of this note said the spectra were out of reach. That is no
+longer true — the `.wiff.scan` packing is now fully worked out and this crate
+encodes as well as decodes it. From inspection of real ZenoTOF 7600 data:
 
-Established by inspection of real ZenoTOF 7600 data:
+- `.wiff2` is **encrypted / high-entropy** — not open SQLite. It is *not* required
+  to read the spectra (ProteoWizard reads a `.wiff` + `.wiff.scan` with no
+  `.wiff2`), so it is not needed here.
+- `.wiff.scan` is **not encrypted**. It is a sequential stream of units, each
+  `[protobuf metadata][ffffffff  u32 hdr  00  token-stream]`. Peaks are stored
+  m/z-ascending as `(n, intensity)` with `n` an integer TOF sample index and
+  `m/z = (a/5·n + b)²` (`a`,`b` = the two per-scan calibration doubles in the
+  metadata). The full token grammar (gap/consecutive deltas + intensity escapes)
+  is documented at the top of `src/wiffscan.rs`.
+- The codec is **round-trip byte-identical** against real blocks — see the
+  `parity_real_wiff_scan` test (gated on `TIMSIM_SCIEX_WIFF_SCAN=<path>`), which
+  decodes→re-encodes real scan blocks and asserts the bytes match exactly.
 
-- `.wiff2` is **encrypted / high-entropy** — not open SQLite (the common web
-  claim is wrong for current ZenoTOF data).
-- `.wiff.scan` holds the spectra in a **proprietary packed binary** (no known
-  codec; no Linux oracle — Clearcore2/WiffReader is Windows-bound and fails on
-  Mono/Wine). SCIEX's EULA forbids decompiling Clearcore2.
-- `.wiff` **is** open OLE2 and exposes the method (Period → Experiment cycle,
-  61-window SWATH, Zeno attributes, TOF calibration).
-
-**Conclusion: SCIEX *output* from the simulator goes via mzML** (or the pwiz
-container, used as intended, for real→mzML ground truth). This crate supplies
-the windows + calibration that let the simulator reproduce a real run's
-acquisition layout. Reading real spectra is out of scope (and not needed for
-simulated output).
+**Oracle / legitimacy.** Everything here was derived by inspecting the *data
+file* (the same legal footing as reading any file format), using **ProteoWizard
+as a read-only oracle** (`msconvert` under Wine, used as intended) to check
+decoded peaks against the vendor's own interpretation. No Clearcore2 binary is
+decompiled, disassembled, or linked; the SDK EULA is not touched.
 
 ## Reference data
 

@@ -3,6 +3,8 @@
 //! and legitimacy notes — this reads the open OLE2 method, not the proprietary
 //! `.wiff.scan` spectra.
 
+pub mod wiffscan;
+
 use std::io;
 use std::path::Path;
 
