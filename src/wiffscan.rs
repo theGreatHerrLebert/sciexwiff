@@ -470,21 +470,21 @@ pub fn rebuild_grow(
 ) -> Result<(Vec<u8>, Vec<(usize, i64)>), WriterError> {
     validate_blocks(scan, blocks)?;
     // Sort edits by the block body start; ensure they are disjoint and in range.
-    let mut ordered: Vec<(usize, usize, &[u8])> = Vec::with_capacity(edits.len());
+    let mut ordered: Vec<(usize, usize, &[u8], usize)> = Vec::with_capacity(edits.len());
     for e in edits {
         let b = blocks.get(e.block).ok_or(WriterError::BadBlock(e.block))?;
         let tok_start = b.ff + 9;
         let tok_end = b.end; // replace the whole body
-        ordered.push((tok_start, tok_end, &e.tokens));
+        ordered.push((tok_start, tok_end, &e.tokens, e.block));
     }
-    ordered.sort_by_key(|&(s, _, _)| s);
+    ordered.sort_by_key(|&(s, _, _, _)| s);
     let mut out = Vec::with_capacity(scan.len() + (1 << 16));
     let mut breakpoints: Vec<(usize, i64)> = Vec::with_capacity(ordered.len());
     let mut cum: i64 = 0;
     let mut cursor = 0usize;
-    for (tok_start, tok_end, tokens) in ordered {
+    for (tok_start, tok_end, tokens, bi) in ordered {
         if tok_start < cursor || tok_end < tok_start || tok_end > scan.len() {
-            return Err(WriterError::BadBlock(0)); // overlapping / malformed edit
+            return Err(WriterError::BadBlock(bi)); // overlapping / duplicate / malformed edit
         }
         out.extend_from_slice(&scan[cursor..tok_start]); // verbatim up to the token stream
         out.extend_from_slice(tokens); // the grown tokens
@@ -498,19 +498,23 @@ pub fn rebuild_grow(
 
 /// Translate an old byte offset to its new position given the `rebuild_grow` breakpoints.
 /// Idx offsets point at `ffffffff` block starts, which never fall inside a grown token region,
-/// so the mapping is unambiguous.
-pub fn translate_offset(old: usize, breakpoints: &[(usize, i64)]) -> usize {
+/// so the mapping is unambiguous. Returns `None` if the (possibly negative) cumulative delta
+/// underflows the offset — a malformed edit set rather than a valid position.
+pub fn translate_offset(old: usize, breakpoints: &[(usize, i64)]) -> Option<usize> {
     // Largest breakpoint whose token-start position is < `old` applies (a block that starts at
     // or after `old` does not shift it). Breakpoints are sorted by position.
     let i = breakpoints.partition_point(|&(pos, _)| pos < old);
     let d = if i == 0 { 0 } else { breakpoints[i - 1].1 };
-    (old as i64 + d) as usize
+    (old as i64).checked_add(d).and_then(|v| usize::try_from(v).ok())
 }
 
 /// Retranslate every Idx record's `+32` / `+86` / `+36` offsets through the `rebuild_grow`
 /// breakpoint map. Handles ALL records (enumerated or not); the Idx length is unchanged.
 pub fn retranslate_idx(idx: &[u8], breakpoints: &[(usize, i64)]) -> Result<Vec<u8>, WriterError> {
+    // The Idx stream is `n` full 108-byte records + a short trailing tail (a real property of
+    // the format); only the full records are retranslated, the tail is copied verbatim.
     let mut out = idx.to_vec();
+    let tr = |abs: usize| translate_offset(abs, breakpoints).ok_or(WriterError::BadSegment(0));
     let to_rel = |abs: usize| -> Result<u32, WriterError> {
         abs.checked_sub(44)
             .ok_or(WriterError::Truncated)
@@ -522,16 +526,16 @@ pub fn retranslate_idx(idx: &[u8], breakpoints: &[(usize, i64)]) -> Result<Vec<u
         let o86 = u32le(idx, base + 86)? as usize;
         let o36 = u32le(idx, base + 36)? as usize;
         if o32 > 0 {
-            let ff1_old = 44 + o32;
-            let ff1_new = translate_offset(ff1_old, breakpoints);
+            let ff1_old = 44usize.checked_add(o32).ok_or(WriterError::Truncated)?;
+            let ff1_new = tr(ff1_old)?;
             put_u32le(&mut out, base + 32, to_rel(ff1_new)?)?;
             // +36 is block2_meta relative to block1; recompute from the translated positions.
-            let block2_meta_new = translate_offset(ff1_old + o36, breakpoints);
-            let new_o36 = block2_meta_new.checked_sub(ff1_new).ok_or(WriterError::Truncated)?;
+            let block2_meta_old = ff1_old.checked_add(o36).ok_or(WriterError::Truncated)?;
+            let new_o36 = tr(block2_meta_old)?.checked_sub(ff1_new).ok_or(WriterError::BadSegment(r))?;
             put_u32le(&mut out, base + 36, u32::try_from(new_o36).map_err(|_| WriterError::Truncated)?)?;
         }
         if o86 > 0 {
-            let ff2_new = translate_offset(44 + o86, breakpoints);
+            let ff2_new = tr(44usize.checked_add(o86).ok_or(WriterError::Truncated)?)?;
             put_u32le(&mut out, base + 86, to_rel(ff2_new)?)?;
         }
     }
@@ -642,9 +646,64 @@ mod tests {
     fn translate_offset_shifts_after_grown_block() {
         // A grown block at old token-start 100 that adds 5 bytes shifts everything at/after it.
         let bp = vec![(100usize, 5i64)];
-        assert_eq!(translate_offset(50, &bp), 50, "before the grow: unchanged");
-        assert_eq!(translate_offset(100, &bp), 100, "at the grow start: unchanged");
-        assert_eq!(translate_offset(200, &bp), 205, "after the grow: +5");
+        assert_eq!(translate_offset(50, &bp), Some(50), "before the grow: unchanged");
+        assert_eq!(translate_offset(100, &bp), Some(100), "at the grow start: unchanged");
+        assert_eq!(translate_offset(200, &bp), Some(205), "after the grow: +5");
+        // A net-negative delta that underflows an offset is rejected, not wrapped.
+        assert_eq!(translate_offset(3, &[(0usize, -10i64)]), None);
+    }
+
+    // Build a synthetic .wiff.scan: 44-byte header + `n` blocks, each `[meta len-prefix +
+    // 0a1209 + cal_a f64 + 11 + cal_b f64 + 12 06 ..pad..][ffffffff][hdr u32][00][tokens]`.
+    // Returns (bytes, blocks). cal chosen in the sane range so `scan_blocks` enumerates them.
+    fn synth_scan(token_lens: &[usize]) -> (Vec<u8>, Vec<ScanBlock>) {
+        let mut b = vec![0u8; 44];
+        for &tl in token_lens {
+            // metadata: 0x1d len, then 0a1209 <a> 11 <b> 12 06 08 00 10 08  (28 bytes body)
+            let mut meta = vec![0x0a, 0x12, 0x09];
+            meta.extend_from_slice(&0.000489823_f64.to_le_bytes());
+            meta.push(0x11);
+            meta.extend_from_slice(&(-12.9765_f64).to_le_bytes());
+            // pad the field-2 submessage so the metadata is >= 27 bytes (scan_blocks requires it)
+            meta.extend_from_slice(&[0x12, 0x08, 0x08, 0x00, 0x10, 0x08, 0x00, 0x00]);
+            b.push(meta.len() as u8); // len prefix (>= 27)
+            b.extend_from_slice(&meta);
+            b.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]); // sentinel
+            b.extend_from_slice(&0u32.to_le_bytes()); // hdr
+            b.push(0x00);
+            b.extend(std::iter::repeat_n(0x01u8, tl)); // tokens (0x01 = a peak)
+        }
+        let blocks = scan_blocks(&b);
+        (b, blocks)
+    }
+
+    #[test]
+    fn rebuild_grow_shifts_later_blocks() {
+        // Three blocks; grow the first, shrink the second — the third's Idx offset must track.
+        let (scan, blocks) = synth_scan(&[10, 10, 10]);
+        assert_eq!(blocks.len(), 3, "three enumerated blocks");
+        // Build a minimal 1-record Idx: o32 -> block0.ff, o86 -> block2.ff, o36 = block1.meta-block0.ff.
+        let mut idx = vec![0u8; IDX_RS];
+        let put = |idx: &mut [u8], off: usize, v: u32| idx[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut idx, 32, (blocks[0].ff - 44) as u32);
+        put(&mut idx, 86, (blocks[2].ff - 44) as u32);
+        put(&mut idx, 36, (blocks[1].meta - blocks[0].ff) as u32);
+        // Grow block0 (10 -> 20 tokens), shrink block1 (10 -> 4). Body = ff+9..end.
+        let g0 = vec![0x01u8; blocks[0].end - (blocks[0].ff + 9) + 10];
+        let g1 = vec![0x01u8; (blocks[1].end - (blocks[1].ff + 9)).saturating_sub(6)];
+        let edits = vec![
+            GrowEdit { block: 0, tokens: g0 },
+            GrowEdit { block: 1, tokens: g1 },
+        ];
+        let (new_scan, bp) = rebuild_grow(&scan, &blocks, &edits).expect("grow");
+        let new_idx = retranslate_idx(&idx, &bp).expect("retranslate");
+        // The translated o32/o86/o36 must land on real block starts / boundaries in new_scan.
+        let no32 = u32::from_le_bytes(new_idx[32..36].try_into().unwrap()) as usize;
+        let no86 = u32::from_le_bytes(new_idx[86..90].try_into().unwrap()) as usize;
+        assert_eq!(&new_scan[44 + no32..44 + no32 + 4], b"\xff\xff\xff\xff", "block0 sentinel");
+        assert_eq!(&new_scan[44 + no86..44 + no86 + 4], b"\xff\xff\xff\xff", "block2 sentinel");
+        // block2 shifted by (+10 from grow) + (-6 from shrink) = +4.
+        assert_eq!(44 + no86, blocks[2].ff + 4, "block2 shifted by net delta");
     }
 
     #[test]
