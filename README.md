@@ -38,6 +38,18 @@ as a read-only oracle** (`msconvert` under Wine, used as intended) to check
 decoded peaks against the vendor's own interpretation. No Clearcore2 binary is
 decompiled, disassembled, or linked; the SDK EULA is not touched.
 
+
+## Authoring / writer
+
+`wiffscan` also **writes** `.wiff.scan`: `map_segments` resolves the `Idx` directory (each 108-byte
+record indexes a 2-block *segment*: `+32` = block1 offset, `+86` = block2 offset, `+36` =
+block2-metadata relative to block1), `rebuild` streams every physical block into a new buffer
+(edited payloads replaced, the rest verbatim), and `recompute_idx` recomputes `+32`/`+86`/`+36`
+from the new positions — so a scan can hold *more* peaks than the reference block did, with the
+acquisition layout preserved. All writer entry points return `Result` (they never panic on
+malformed input), which keeps them safe to wrap with PyO3. A no-edit rebuild is byte-identical and
+round-trips the `Idx` exactly (`rebuild_roundtrip_real`, gated on `TIMSIM_SCIEX_WIFF_SCAN`).
+
 ## Reference data
 
 The decoding above was validated against:

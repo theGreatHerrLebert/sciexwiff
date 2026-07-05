@@ -76,7 +76,7 @@ pub fn read_method<P: AsRef<Path>>(path: P) -> io::Result<WiffMethod> {
         })?;
     const BASE: usize = 40;
     const STRIDE: usize = 20;
-    if sw.len() < BASE || (sw.len() - BASE) % STRIDE != 0 {
+    if sw.len() < BASE || !(sw.len() - BASE).is_multiple_of(STRIDE) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("SWATHMethod stream has a truncated record table ({} bytes)", sw.len()),

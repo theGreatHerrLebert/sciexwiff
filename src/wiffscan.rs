@@ -14,9 +14,15 @@
 //! - `0xfd [lo][hi]` — delta = `lo + hi·256 + 1` (>256), then the intensity field
 //!
 //! Intensity field: `c 0x00..=0x7b` → `c`; `0x7c [b]` → `b` (124..=255);
-//! `0x7d [lo][hi]` → 2-byte (>255); `0x7e [lo][mid][hi]` → 3-byte. `0x7f..=0xff` is invalid.
+//! `0x7d [lo][hi]` → 2-byte (>255); `0x7e [lo][mid][hi]` → 3-byte; `0x80..=0xff` → raw 128..=255.
+//!
+//! The vendor encoder is NON-CANONICAL: some blocks encode delta 127/128 as `0xfe`/`0xff` and some
+//! store intensity 128..=255 raw vs `0x7c`-escaped. The DECODER accepts all forms; the ENCODER
+//! emits one canonical form (which the reader accepts). The writer therefore copies unedited blocks
+//! verbatim and re-encodes only the blocks it authors — so `decode → encode` is peaks-stable but
+//! not universally byte-identical (see the `rebuild` writer and the `parity_real_wiff_scan` test).
 
-/// Largest representable intensity (3-byte `0x7e` escape).
+/// Exclusive upper bound on intensity (3-byte `0x7e` escape holds up to `MAX_INTENSITY - 1`).
 pub const MAX_INTENSITY: u32 = 1 << 24;
 /// The 2-byte `0xfd` delta escape carries `delta - 1`; larger deltas are auto-bridged.
 pub const FD_MAX_DELTA: i64 = 65536;
@@ -71,20 +77,17 @@ fn read_int(body: &[u8], i: usize, strict: bool) -> Result<(u32, usize), CodecEr
     let c = *body.get(i).ok_or(CodecError::Truncated)?;
     let g = |o: usize| body.get(o).copied().ok_or(CodecError::Truncated);
     match c {
-        0x00..=0x7b => Ok((c as u32, i + 1)),
-        0x7c => Ok((g(i + 1)? as u32, i + 2)),
-        0x7d => Ok((g(i + 1)? as u32 | (g(i + 2)? as u32) << 8, i + 3)),
+        0x00..=0x7b => Ok((c as u32, i + 1)),                          // raw 0..123
+        0x7c => Ok((g(i + 1)? as u32, i + 2)),                         // 1-byte escape 124..255
+        0x7d => Ok((g(i + 1)? as u32 | (g(i + 2)? as u32) << 8, i + 3)),               // 2-byte
         0x7e => Ok((
-            g(i + 1)? as u32 | (g(i + 2)? as u32) << 8 | (g(i + 3)? as u32) << 16,
+            g(i + 1)? as u32 | (g(i + 2)? as u32) << 8 | (g(i + 3)? as u32) << 16,     // 3-byte
             i + 4,
         )),
-        _ => {
-            if strict {
-                Err(CodecError::BadIntensityPrefix(c))
-            } else {
-                Ok((c as u32, i + 1))
-            }
+        0x7f => {
+            if strict { Err(CodecError::BadIntensityPrefix(c)) } else { Ok((c as u32, i + 1)) }
         }
+        _ => Ok((c as u32, i + 1)), // 0x80..=0xff : raw intensity 128..255 (block-dependent)
     }
 }
 
@@ -93,48 +96,57 @@ fn read_int(body: &[u8], i: usize, strict: bool) -> Result<(u32, usize), CodecEr
 /// position is ignored, matching the vendor reader). Stops at `npeaks` or end of buffer.
 pub fn decode_stream(
     body: &[u8],
-    mut i: usize,
+    i: usize,
     seed_n: i64,
     npeaks: usize,
     strict: bool,
 ) -> Result<Vec<Peak>, CodecError> {
-    let mut peaks = Vec::with_capacity(npeaks.min(4096));
+    Ok(decode_tracked(body, i, seed_n, npeaks, strict).0)
+}
+
+/// Like `decode_stream` but also returns, for each peak, its token byte-span [start,end) and the
+/// final cursor. A trailing PARTIAL token stops decoding cleanly (matches the reader tolerating a
+/// truncated tail). This is the primitive the writer uses to split payload from terminator.
+pub fn decode_tracked(
+    body: &[u8],
+    mut i: usize,
+    seed_n: i64,
+    npeaks: usize,
+    strict: bool,
+) -> (Vec<Peak>, Vec<(usize, usize)>, usize) {
+    let mut peaks = Vec::new();
+    let mut spans = Vec::new();
     let mut prev = seed_n;
     let mut first = true;
-    while peaks.len() < npeaks && i < body.len() {
+    let n = body.len();
+    while peaks.len() < npeaks && i < n {
+        let start = i;
         let b = body[i];
-        let (delta, inten) = match b {
-            0xfc => {
-                let d = *body.get(i + 1).ok_or(CodecError::Truncated)? as i64 + 1;
-                let (v, ni) = read_int(body, i + 2, strict)?;
-                i = ni;
-                (d, v)
-            }
-            0xfd => {
-                let lo = *body.get(i + 1).ok_or(CodecError::Truncated)? as i64;
-                let hi = *body.get(i + 2).ok_or(CodecError::Truncated)? as i64;
-                let (v, ni) = read_int(body, i + 3, strict)?;
-                i = ni;
-                (lo + (hi << 8) + 1, v)
-            }
-            0x80..=0xff => {
-                let d = b as i64 - 0x7f;
-                let (v, ni) = read_int(body, i + 1, strict)?;
-                i = ni;
-                (d, v)
-            }
-            _ => {
-                let (v, ni) = read_int(body, i, strict)?;
-                i = ni;
-                (1, v)
-            }
+        let res: Option<(i64, u32, usize)> = match b {
+            0xfc => body.get(i + 1).and_then(|&d1| {
+                read_int(body, i + 2, strict).ok().map(|(v, ni)| (d1 as i64 + 1, v, ni))
+            }),
+            0xfd => match (body.get(i + 1), body.get(i + 2)) {
+                (Some(&lo), Some(&hi)) => read_int(body, i + 3, strict)
+                    .ok()
+                    .map(|(v, ni)| (lo as i64 + ((hi as i64) << 8) + 1, v, ni)),
+                _ => None,
+            },
+            0x80..=0xff => read_int(body, i + 1, strict).ok().map(|(v, ni)| (b as i64 - 0x7f, v, ni)),
+            _ => read_int(body, i, strict).ok().map(|(v, ni)| (1i64, v, ni)),
         };
-        let n = if first { seed_n } else { prev + delta };
+        let (delta, inten, ni) = match res {
+            Some(t) => t,
+            None => break, // partial trailing token
+        };
+        i = ni;
+        let nval = if first { seed_n } else { prev + delta };
         first = false;
-        prev = n;
-        peaks.push((n, inten));
+        prev = nval;
+        peaks.push((nval, inten));
+        spans.push((start, i));
     }
-    Ok(peaks)
+    (peaks, spans, i)
 }
 
 fn put_int(out: &mut Vec<u8>, v: u32) -> Result<(), CodecError> {
@@ -163,6 +175,10 @@ fn put_int(out: &mut Vec<u8>, v: u32) -> Result<(), CodecError> {
 }
 
 fn put_delta_int(out: &mut Vec<u8>, delta: i64, inten: u32) -> Result<(), CodecError> {
+    // Encode canonically as gap markers (0x80..=0xfb -> 1..=124) then the 0xfc/0xfd escapes.
+    // NOTE: the vendor is non-canonical — some blocks encode delta 127/128 as 0xfe/0xff and some
+    // intensities 128..255 raw; the DECODER accepts all of those. We emit one canonical form (the
+    // reader accepts it); unedited blocks are copied verbatim so their exact bytes are preserved.
     match delta {
         1 => {}
         2..=124 => out.push((0x7f + delta) as u8),
@@ -192,7 +208,7 @@ pub fn encode_stream(peaks: &[Peak]) -> Result<Vec<u8>, CodecError> {
             put_int(&mut out, inten)?;
             continue;
         }
-        let mut delta = n - prev;
+        let mut delta = n.checked_sub(prev).ok_or(CodecError::NonIncreasing { index: k, delta: 0 })?;
         prev = n;
         if delta <= 0 {
             return Err(CodecError::NonIncreasing { index: k, delta });
@@ -215,8 +231,8 @@ pub fn scan_blocks(sb: &[u8]) -> Vec<ScanBlock> {
     let mut starts: Vec<(usize, usize, f64, f64)> = Vec::new();
     let mut i = 0usize;
     while i + 21 <= sb.len() {
-        if sb[i] == 0x0a && sb[i + 1] == 0x12 && sb[i + 2] == 0x09 {
-            if i >= 1 && sb[i - 1] >= 27 && sb[i + 11] == 0x11 && sb[i + 20] == 0x12 {
+        if sb[i] == 0x0a && sb[i + 1] == 0x12 && sb[i + 2] == 0x09
+            && i >= 1 && sb[i - 1] >= 27 && sb[i + 11] == 0x11 && sb[i + 20] == 0x12 {
                 let s = i - 1;
                 let ff = s + 1 + sb[s] as usize;
                 if ff + 4 <= sb.len() && &sb[ff..ff + 4] == b"\xff\xff\xff\xff" {
@@ -227,7 +243,6 @@ pub fn scan_blocks(sb: &[u8]) -> Vec<ScanBlock> {
                     }
                 }
             }
-        }
         i += 1;
     }
     let mut out = Vec::with_capacity(starts.len());
@@ -254,6 +269,191 @@ fn f64le(b: &[u8], o: usize) -> Option<f64> {
         .map(|s| f64::from_le_bytes(s.try_into().unwrap()))
 }
 
+// ============================================================================================
+// Writer: rebuild a .wiff.scan (author arbitrary peaks/scan) + recompute the Idx directory.
+//
+// The Idx stream (108 B/record) indexes a 2-block SEGMENT: +32 = block1 ffffffff offset (rel byte
+// 44), +86 = block2 ffffffff offset, +36 = block2_meta_start - block1_ff. The writer streams every
+// physical block into a new buffer (edited payloads replaced, the rest verbatim) and recomputes
+// +32/+86/+36 from the NEW positions — so there is no in-place offset patching and cumulative
+// edits are handled correctly. PyO3-friendly: all inputs/outputs are byte slices / Vec<u8>.
+// ============================================================================================
+
+const IDX_RS: usize = 108;
+
+/// Errors from the writer path. Kept separate from [`CodecError`] so the FFI boundary can map a
+/// structural/bounds failure to a Python exception instead of panicking across it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WriterError {
+    /// A buffer (scan or Idx) was shorter than the structure required.
+    Truncated,
+    /// A physical block's offsets were inconsistent (meta..ff..end out of order or out of range).
+    BadBlock(usize),
+    /// A segment references block indices out of range, or is structurally impossible (e.g. a
+    /// block2 with no block1 in a 2-block segment), or produced an offset that underflows.
+    BadSegment(usize),
+}
+
+fn u32le(b: &[u8], o: usize) -> Result<u32, WriterError> {
+    let s = b.get(o..o + 4).ok_or(WriterError::Truncated)?;
+    Ok(u32::from_le_bytes(s.try_into().expect("length checked")))
+}
+fn put_u32le(b: &mut [u8], o: usize, v: u32) -> Result<(), WriterError> {
+    let s = b.get_mut(o..o + 4).ok_or(WriterError::Truncated)?;
+    s.copy_from_slice(&v.to_le_bytes());
+    Ok(())
+}
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() { return None; }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// One Idx record mapped onto physical block indices (block1 always present when indexed).
+#[derive(Clone, Copy, Debug)]
+pub struct Segment {
+    pub rec: usize,
+    pub b1: Option<usize>,
+    pub b2: Option<usize>,
+}
+
+/// Validate that every block's `meta <= ff`, `ff + 9 <= end`, `end <= scan.len()`.
+fn validate_blocks(scan: &[u8], blocks: &[ScanBlock]) -> Result<(), WriterError> {
+    if scan.len() < 44 { return Err(WriterError::Truncated); }
+    for (i, b) in blocks.iter().enumerate() {
+        if !(b.meta <= b.ff && b.ff + 9 <= b.end && b.end <= scan.len()) {
+            return Err(WriterError::BadBlock(i));
+        }
+    }
+    Ok(())
+}
+
+/// Enumerate physical blocks and map every Idx record onto them by offset.
+pub fn map_segments(scan: &[u8], idx: &[u8]) -> Result<(Vec<ScanBlock>, Vec<Segment>), WriterError> {
+    let blocks = scan_blocks(scan);
+    validate_blocks(scan, &blocks)?;
+    let mut ff_to_i = std::collections::HashMap::with_capacity(blocks.len());
+    for (i, b) in blocks.iter().enumerate() {
+        ff_to_i.insert(b.ff, i);
+    }
+    let mut segs = Vec::new();
+    for r in 0..idx.len() / IDX_RS {
+        let o32 = u32le(idx, r * IDX_RS + 32)? as usize;
+        let o86 = u32le(idx, r * IDX_RS + 86)? as usize;
+        let b1 = if o32 > 0 { ff_to_i.get(&(44 + o32)).copied() } else { None };
+        let b2 = if o86 > 0 && o86 != o32 { ff_to_i.get(&(44 + o86)).copied() } else { None };
+        if b1.is_some() || b2.is_some() {
+            segs.push(Segment { rec: r, b1, b2 });
+        }
+    }
+    Ok((blocks, segs))
+}
+
+/// Decode an editable block's payload peaks and its terminator byte-length. Trailing tokens whose
+/// bytes are ALL 0xff are the block terminator (2 or 4 bytes) and are dropped. Caller must have
+/// validated `b` (see [`validate_blocks`]).
+pub fn block_payload(scan: &[u8], b: &ScanBlock) -> Result<(Vec<Peak>, usize), WriterError> {
+    let body = scan.get(b.ff + 9..b.end).ok_or(WriterError::BadBlock(0))?;
+    let (mut peaks, mut spans, _) = decode_tracked(body, 0, 0, usize::MAX, false);
+    let mut term = 0usize;
+    while let Some(&(s, e)) = spans.last() {
+        if body[s..e].iter().all(|&x| x == 0xff) {
+            term += e - s;
+            peaks.pop();
+            spans.pop();
+        } else {
+            break;
+        }
+    }
+    Ok((peaks, term))
+}
+
+/// Output of [`rebuild`]: (new `.wiff.scan` bytes, new `ffffffff` position per block, metadata
+/// length per block). The latter two feed [`recompute_idx`].
+pub type RebuildOutput = (Vec<u8>, Vec<usize>, Vec<usize>);
+
+/// Rebuild the `.wiff.scan`. `edits` maps a physical block index -> new payload token bytes (as
+/// from `encode_stream`). Returns (new_scan, new_ff positions, metadata lengths).
+pub fn rebuild(
+    scan: &[u8],
+    blocks: &[ScanBlock],
+    edits: &std::collections::HashMap<usize, Vec<u8>>,
+) -> Result<RebuildOutput, WriterError> {
+    validate_blocks(scan, blocks)?;
+    let mut out = Vec::with_capacity(scan.len() + 4096);
+    out.extend_from_slice(&scan[..44]);
+    let mut new_ff = vec![0usize; blocks.len()];
+    let mut metalen = vec![0usize; blocks.len()];
+    for (i, b) in blocks.iter().enumerate() {
+        metalen[i] = b.ff - b.meta;
+        out.extend_from_slice(&scan[b.meta..b.ff]); // metadata
+        new_ff[i] = out.len(); // this block's ffffffff
+        match edits.get(&i) {
+            Some(payload) => {
+                out.extend_from_slice(&scan[b.ff..b.ff + 9]); // ffffffff + u32hdr + 00
+                out.extend_from_slice(payload);
+                let (_, mut term) = block_payload(scan, b)?; // preserve original terminator length
+                if term == 0 { term = 4; }
+                out.extend(std::iter::repeat_n(0xffu8, term));
+            }
+            None => out.extend_from_slice(&scan[b.ff..b.end]), // verbatim
+        }
+    }
+    Ok((out, new_ff, metalen))
+}
+
+/// Recompute +32/+86/+36 for every segment from the new block positions. Returns a new Idx buffer
+/// (same length as the input). A segment with a block2 but no block1 is rejected (a 2-block
+/// segment cannot be described without its block1 anchor).
+pub fn recompute_idx(
+    idx: &[u8],
+    segs: &[Segment],
+    new_ff: &[usize],
+    metalen: &[usize],
+) -> Result<Vec<u8>, WriterError> {
+    let mut idx = idx.to_vec();
+    let err = |rec: usize| WriterError::BadSegment(rec);
+    let off = |ff: usize, rec: usize| ff.checked_sub(44).ok_or(err(rec))
+        .and_then(|o| u32::try_from(o).map_err(|_| err(rec)));
+    for s in segs {
+        // +36 (block2_meta relative to block1) can only be written when BOTH blocks are present.
+        // A segment with only block2 (empty block1 slot, o32==0) keeps its original +36.
+        if let Some(i1) = s.b1 {
+            let ff1 = *new_ff.get(i1).ok_or(err(s.rec))?;
+            put_u32le(&mut idx, s.rec * IDX_RS + 32, off(ff1, s.rec)?)?;
+            if let Some(i2) = s.b2 {
+                let ff2 = *new_ff.get(i2).ok_or(err(s.rec))?;
+                let ml2 = *metalen.get(i2).ok_or(err(s.rec))?;
+                let block2_meta = ff2.checked_sub(ml2).ok_or(err(s.rec))?;
+                let o36 = block2_meta.checked_sub(ff1).ok_or(err(s.rec))?;
+                put_u32le(&mut idx, s.rec * IDX_RS + 86, off(ff2, s.rec)?)?;
+                put_u32le(&mut idx, s.rec * IDX_RS + 36, u32::try_from(o36).map_err(|_| err(s.rec))?)?;
+            }
+        } else if let Some(i2) = s.b2 {
+            let ff2 = *new_ff.get(i2).ok_or(err(s.rec))?;
+            put_u32le(&mut idx, s.rec * IDX_RS + 86, off(ff2, s.rec)?)?; // +36 unchanged (no block1)
+        }
+    }
+    Ok(idx)
+}
+
+/// Locate the `Idx` stream inside a `.wiff` CFB by an unambiguous 4-record needle (the Idx stream
+/// is unchanged in length, so it can be patched in place). Returns the stream's byte offset.
+pub fn locate_idx_in_wiff(raw: &[u8], idx: &[u8]) -> Option<usize> {
+    let anchor = 5000 * IDX_RS;
+    let needle = idx.get(anchor..anchor + IDX_RS * 4)?;
+    let pos = find_sub(raw, needle)?;
+    if find_sub(&raw[pos + 1..], needle).is_some() {
+        return None; // not unique
+    }
+    let ib = pos.checked_sub(anchor)?;
+    for k in [0usize, 1000, 20000, 51000] {
+        if raw.get(ib + k * IDX_RS..ib + (k + 1) * IDX_RS)? != &idx[k * IDX_RS..(k + 1) * IDX_RS] {
+            return None;
+        }
+    }
+    Some(ib)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +473,35 @@ mod tests {
     #[test]
     fn strict_rejects_0x7f() {
         assert_eq!(read_int(&[0x7f, 0], 0, true).unwrap_err(), CodecError::BadIntensityPrefix(0x7f));
+    }
+
+    /// Writer round-trip against a real file (gated on `TIMSIM_SCIEX_WIFF_SCAN`, needs the sibling
+    /// `.wiff`): a no-edit rebuild must be byte-identical, and recomputing the Idx from the
+    /// unchanged positions must reproduce the original Idx (proving the +32/+86/+36 formulas).
+    #[test]
+    fn rebuild_roundtrip_real() {
+        let scan_path = match std::env::var("TIMSIM_SCIEX_WIFF_SCAN") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let wiff_path = scan_path.strip_suffix(".scan").expect("path ends with .scan").to_string();
+        let scan = std::fs::read(&scan_path).expect("read .wiff.scan");
+        let mut comp = cfb::open(&wiff_path).expect("open .wiff CFB");
+        let mut idx = Vec::new();
+        {
+            use std::io::Read;
+            comp.open_stream("SampleSubtree/Sample1/Idx")
+                .expect("Idx stream")
+                .read_to_end(&mut idx)
+                .unwrap();
+        }
+        let (blocks, segs) = map_segments(&scan, &idx).expect("map_segments");
+        assert!(blocks.len() > 1000 && segs.len() > 1000);
+        let (new_scan, new_ff, metalen) = rebuild(&scan, &blocks, &std::collections::HashMap::new()).expect("rebuild");
+        assert_eq!(new_scan, scan, "no-edit rebuild not byte-identical");
+        let new_idx = recompute_idx(&idx, &segs, &new_ff, &metalen).expect("recompute_idx");
+        assert_eq!(new_idx, idx, "no-edit Idx recompute != original");
+        eprintln!("rebuild: {} blocks, {} indexed segments; no-edit round-trip OK", blocks.len(), segs.len());
     }
 
     #[test]
@@ -318,29 +547,34 @@ mod tests {
         let sb = std::fs::read(&path).expect("read .wiff.scan");
         let blocks = scan_blocks(&sb);
         assert!(blocks.len() > 100, "expected many scan blocks");
-        // decode->encode every rich block and assert byte-identical token streams
+        // Universal invariant: decode -> encode -> decode reproduces the SAME peaks. (Byte-identity
+        // is NOT universal because the vendor encoder is non-canonical: some blocks use 0xfe/0xff
+        // for delta 127/128, some store intensity 128..255 raw. We also track how many happen to be
+        // byte-identical, which should be the majority — the MS1-canonical form.)
         let mut checked = 0;
+        let mut byte_identical = 0;
         for b in &blocks {
             let slot = &sb[b.stream_start()..b.end];
             if slot.len() < 200 {
-                continue; // skip empty/marker blocks
+                continue;
             }
-            // Decode a bounded prefix that stays well inside the block, re-encode, and assert the
-            // token bytes are byte-identical. (Decoding past the block would hit the next block's
-            // metadata and, under strict mode, error — so we bound the peak count.)
-            let peaks = match decode_stream(&sb, b.stream_start(), 0, 40, true) {
+            let peaks = match decode_stream(&sb, b.stream_start(), 0, 40, false) {
                 Ok(p) if p.len() >= 8 => p,
                 _ => continue,
             };
             let enc = encode_stream(&peaks).expect("re-encode");
-            assert!(enc.len() <= slot.len());
-            assert_eq!(&enc[..], &slot[..enc.len()], "byte mismatch in block at ff={}", b.ff);
+            // peaks round-trip: decoding our re-encoded stream must give the same peaks back
+            let redec = decode_stream(&enc, 0, peaks[0].0, peaks.len(), false).expect("re-decode");
+            assert_eq!(redec, peaks, "peaks round-trip mismatch in block at ff={}", b.ff);
+            if enc.len() <= slot.len() && enc[..] == slot[..enc.len()] {
+                byte_identical += 1;
+            }
             checked += 1;
             if checked >= 50 {
                 break;
             }
         }
         assert!(checked > 0, "no rich blocks were parity-checked");
-        eprintln!("parity: {checked} real blocks decode->encode byte-identical");
+        eprintln!("parity: {checked} blocks peaks-round-trip OK ({byte_identical} byte-identical)");
     }
 }
