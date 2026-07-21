@@ -779,4 +779,74 @@ mod tests {
         assert!(checked > 0, "no rich blocks were parity-checked");
         eprintln!("parity: {checked} blocks peaks-round-trip OK ({byte_identical} byte-identical)");
     }
+
+    /// Idx-validity probe: for a real `.wiff`, check that every Idx record's block offsets (+32/+86,
+    /// relative to byte 44) resolve to a real block `ffffffff` sentinel. If a minority DON'T, the Idx
+    /// retranslation is corrupt for those blocks and pwiz would seek to the wrong byte. Gated on
+    /// `TIMSIM_SCIEX_WIFF_SCAN`.
+    #[test]
+    fn probe_idx_validity() {
+        let scan_path = match std::env::var("TIMSIM_SCIEX_WIFF_SCAN") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let wiff_path = scan_path.strip_suffix(".scan").expect("ends .scan").to_string();
+        let scan = std::fs::read(&scan_path).expect("read .wiff.scan");
+        let mut comp = cfb::open(&wiff_path).expect("open .wiff CFB");
+        let mut idx = Vec::new();
+        {
+            use std::io::Read;
+            comp.open_stream("SampleSubtree/Sample1/Idx")
+                .expect("Idx stream")
+                .read_to_end(&mut idx)
+                .unwrap();
+        }
+        let blocks = scan_blocks(&scan);
+        let ff_set: std::collections::HashSet<usize> = blocks.iter().map(|b| b.ff).collect();
+        // Bodies of enumerated blocks: (ff+9 .. end). An Idx offset landing here (not at a known ff)
+        // points at a mini/empty block that sits INSIDE an enumerated block's [ff+9..end] region —
+        // which the grow rebuild overwrites and mis-translates.
+        let mut bodies: Vec<(usize, usize)> = blocks.iter().map(|b| (b.ff + 9, b.end)).collect();
+        bodies.sort();
+        let inside_body = |pos: usize| bodies.iter().any(|&(s, e)| pos >= s && pos < e);
+        let (mut offs, mut exact_ff, mut in_body, mut is_ffffffff, mut elsewhere) = (0, 0, 0, 0, 0);
+        let mut samples: Vec<(usize, usize)> = Vec::new();
+        for r in 0..idx.len() / IDX_RS {
+            for field in [32usize, 86] {
+                let off = u32le(&idx, r * IDX_RS + field).unwrap_or(0) as usize;
+                if off == 0 {
+                    continue;
+                }
+                offs += 1;
+                let pos = 44 + off;
+                if ff_set.contains(&pos) {
+                    exact_ff += 1;
+                } else if inside_body(pos) {
+                    in_body += 1;
+                    if scan.get(pos..pos + 4) == Some(&b"\xff\xff\xff\xff"[..]) {
+                        is_ffffffff += 1; // a real (mini-block) ff sentinel, just not enumerated
+                    }
+                    if samples.len() < 6 {
+                        samples.push((r, pos));
+                    }
+                } else {
+                    elsewhere += 1;
+                }
+            }
+        }
+        eprintln!("IDX: {} blocks, {} nonzero offsets", blocks.len(), offs);
+        eprintln!(
+            "  exact block ff:      {} ({:.1}%)",
+            exact_ff, 100.0 * exact_ff as f64 / offs as f64
+        );
+        eprintln!(
+            "  INSIDE a block body: {} ({:.1}%)  <- points at a swallowed mini/empty block; {} are real ffffffff",
+            in_body, 100.0 * in_body as f64 / offs as f64, is_ffffffff
+        );
+        eprintln!("  elsewhere:           {}", elsewhere);
+        for (r, pos) in &samples {
+            let ctx: Vec<String> = scan[*pos..(*pos + 8).min(scan.len())].iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!("  rec {} -> byte {} bytes=[{}]", r, pos, ctx.join(" "));
+        }
+    }
 }
