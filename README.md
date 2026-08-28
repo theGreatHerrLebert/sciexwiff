@@ -79,6 +79,33 @@ SWATH windows (399.5–899.9 m/z) and TOF calibration (4.898e-4 / -12.90).
 cargo run --release -- path/to/sample.wiff
 ```
 
+## Provenance & reverse engineering
+
+This crate contains **no SCIEX SDK, no Clearcore2 assemblies, and no SCIEX
+proprietary code**. Its sole dependency is [`cfb`](https://crates.io/crates/cfb), a
+general-purpose reader for the OLE2/Compound File Binary container that `.wiff` and
+`.wiff.scan` happen to use.
+
+The layout is reconstructed entirely from the data files' own **self-describing
+structure** — stream names and sizes from the CFB directory, the `Idx` stream's
+offset table, and per-scan peak counts read from the records themselves rather than
+assumed. **No existing `.wiff` reader informed this implementation**, so unlike a
+port there is no upstream layout knowledge to attribute; see [`NOTICE`](NOTICE).
+
+Verification uses genuine vendor files but never redistributes them: the
+`parity_real_wiff_scan` and `rebuild_roundtrip_real` tests are gated on
+`TIMSIM_SCIEX_WIFF_SCAN=<path>` and read data the user supplies from outside the
+repository. No Clearcore2 binary is involved in producing or checking any of it.
+
+The SCIEX and ZenoTOF names, and the `.wiff`/`.wiff.scan` formats, are the property
+of their respective owners. This project is an independent, clean-room
+implementation and is not affiliated with or endorsed by SCIEX.
+
 ## License
 
-MIT OR Apache-2.0.
+MIT — see [`LICENSE`](LICENSE).
+
+> This section previously read "MIT OR Apache-2.0", which matched neither
+> `Cargo.toml`'s `license = "MIT"` nor the single MIT `LICENSE` file that ships. The
+> declared license is the operative one. To dual-license the way `thermorawfile`
+> does, add `LICENSE-APACHE` and set `license = "MIT OR Apache-2.0"`.

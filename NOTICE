@@ -1,0 +1,17 @@
+sciexwiff
+Copyright 2026 David Teschner
+
+This project contains no SCIEX SDK, no Clearcore2 assemblies, and no SCIEX
+proprietary code. The .wiff / .wiff.scan layout is reconstructed entirely from the
+data files themselves, read through their OLE2/CFB container with the `cfb` crate.
+No existing .wiff reader informed this implementation; it derives from the files'
+own self-describing structure.
+
+No sample .wiff or .wiff.scan files are distributed with this project. Tests that
+exercise genuine vendor data are environment-gated (TIMSIM_SCIEX_WIFF_SCAN=<path>)
+and read files the user supplies from outside the repository, so no vendor data is
+redistributed here.
+
+The SCIEX and ZenoTOF names, and the .wiff and .wiff.scan formats, are the property
+of their respective owners. This project is an independent, clean-room
+implementation and is not affiliated with or endorsed by SCIEX.
